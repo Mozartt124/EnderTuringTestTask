@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Single-instance Ghost blog (Ghost + MySQL + nginx in Docker on Amazon Linux
+  2023). Public HTTP on port 80, no SSH; administration via SSM Session Manager.
+
+Parameters:
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 x86_64 AMI. deploy.sh resolves it once at stack
+      creation and keeps it on later runs so updates never replace the
+      instance (and its data) just because a newer AMI was published.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: Ghost and MySQL together need about 2 GiB of memory.
+  GhostImage:
+    Type: String
+    Default: ghost:6-alpine
+  MysqlImage:
+    Type: String
+    # Same image, version and digest as Ghost's official Docker Compose file
+    # (TryGhost/ghost-docker compose.yml, service "db").
+    Default: mysql:8.0.46@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+  NginxImage:
+    Type: String
+    Default: nginx:1.28-alpine
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP only. No SSH; use SSM Session Manager.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public blog (HTTP)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Package and image downloads, SSM endpoints
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # The Elastic IP is attached to a network interface that exists before the
+  # instance boots, so the public address Ghost is configured with is already
+  # in place during first-boot setup and survives stop/start.
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      GroupSet:
+        - !Ref WebSecurityGroup
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      NetworkInterfaceId: !Ref NetworkInterface
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ElasticIpAssociation
+      - DefaultRoute
+      - SubnetRouteTableAssociation
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref NetworkInterface
+          DeviceIndex: "0"
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+      # Runs once, on first boot. Containers restart automatically on reboot.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf install -y docker
+          systemctl enable --now docker
+
+          if [ ! -f /swapfile ]; then
+            dd if=/dev/zero of=/swapfile bs=1M count=1024
+            chmod 600 /swapfile
+            mkswap /swapfile
+            echo '/swapfile none swap defaults 0 0' >> /etc/fstab
+          fi
+          swapon -a
+
+          mkdir -p /opt/ghost/content /opt/ghost/mysql /opt/ghost/nginx
+          cd /opt/ghost
+
+          # Generated on the instance; never stored in CloudFormation. Tracing
+          # is off so the values don't reach cloud-init logs or console output.
+          if [ ! -f db.env ]; then
+            set +x
+            (
+              umask 077
+              pw="$(openssl rand -hex 24)"
+              printf 'MYSQL_ROOT_PASSWORD=%s\n' "$(openssl rand -hex 24)" > db.env
+              printf 'MYSQL_DATABASE=ghost\nMYSQL_USER=ghost\nMYSQL_PASSWORD=%s\n' "$pw" >> db.env
+              printf 'database__connection__password=%s\n' "$pw" > ghost.env
+            )
+            set -x
+          fi
+
+          # Public traffic: the blog and the read-only Content API. The Ghost
+          # admin and Admin API are only reachable through the SSM tunnel.
+          cat > nginx/default.conf <<'NGINX'
+          server {
+              listen 80 default_server;
+              # Resolve the container at request time so nginx starts even
+              # while Ghost is still (re)starting; it answers 502 until then.
+              resolver 127.0.0.11 valid=10s;
+              set $ghost http://ghost:2368;
+              location = /ghost { return 404; }
+              location ^~ /ghost/api/content/ { proxy_pass $ghost; include /etc/nginx/conf.d/proxy_headers; }
+              location ^~ /ghost/ { return 404; }
+              location / { proxy_pass $ghost; include /etc/nginx/conf.d/proxy_headers; }
+          }
+          NGINX
+          cat > nginx/proxy_headers <<'NGINX'
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          NGINX
+
+          docker network inspect ghost >/dev/null 2>&1 || docker network create ghost
+
+          docker inspect ghost-db >/dev/null 2>&1 || docker run -d --name ghost-db \
+            --network ghost --restart unless-stopped \
+            --env-file db.env \
+            -v /opt/ghost/mysql:/var/lib/mysql \
+            ${MysqlImage}
+
+          # Ping over TCP like the official compose healthcheck: during first
+          # initialisation MySQL runs a socket-only temporary server, so a
+          # socket ping would report ready too early. No password is needed
+          # for ping, which keeps it out of the cloud-init trace.
+          for _ in $(seq 1 60); do
+            docker exec ghost-db mysqladmin ping -h 127.0.0.1 --silent && break
+            sleep 5
+          done
+
+          # restart=unless-stopped also covers MySQL becoming ready late.
+          docker inspect ghost >/dev/null 2>&1 || docker run -d --name ghost \
+            --network ghost --restart unless-stopped \
+            -p 127.0.0.1:2368:2368 \
+            --env-file ghost.env \
+            -e url=http://${ElasticIp.PublicIp} \
+            -e admin__url=http://localhost:2368 \
+            -e database__client=mysql \
+            -e database__connection__host=ghost-db \
+            -e database__connection__user=ghost \
+            -e database__connection__database=ghost \
+            -v /opt/ghost/content:/var/lib/ghost/content \
+            ${GhostImage}
+
+          docker inspect ghost-web >/dev/null 2>&1 || docker run -d --name ghost-web \
+            --network ghost --restart unless-stopped \
+            -p 80:80 \
+            -v /opt/ghost/nginx:/etc/nginx/conf.d:ro \
+            ${NginxImage}
+
+Outputs:
+  PublicUrl:
+    Description: Public blog URL (plain HTTP)
+    Value: !Sub http://${ElasticIp.PublicIp}
+  InstanceId:
+    Value: !Ref Instance
+  AdminTunnelCommand:
+    Description: Forward the Ghost admin to http://localhost:2368/ghost/
+    Value: !Sub >-
+      aws ssm start-session --target ${Instance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["2368"],"localPortNumber":["2368"]}'
+  ShellCommand:
+    Description: Shell on the instance via Session Manager
+    Value: !Sub aws ssm start-session --target ${Instance}
