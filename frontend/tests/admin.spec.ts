@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test"
 import { firstSuperuser, firstSuperuserPassword } from "./config.ts"
-import { createUserWithRole, setUserRole } from "./utils/adminApi"
+import { createUserWithRole, getUser, setUserRole } from "./utils/adminApi"
 import { createUser } from "./utils/privateApi"
 import { randomEmail, randomPassword } from "./utils/random"
 import { logInUser } from "./utils/user"
@@ -268,6 +268,60 @@ test.describe("Admin page access control", () => {
     await expect(
       page.getByText("Welcome back, nice to see you again!"),
     ).toBeVisible()
+  })
+
+  test("Admin demoted mid-edit gets 403, target is unchanged, session survives", async ({
+    page,
+  }) => {
+    const email = randomEmail()
+    const password = randomPassword()
+    const admin = await createUserWithRole({ email, password, role: "admin" })
+    const targetEmail = randomEmail()
+    const target = await createUserWithRole({
+      email: targetEmail,
+      password: randomPassword(),
+      role: "member",
+    })
+    const targetBefore = await getUser(target.id)
+
+    // Admin opens the edit form for the target user.
+    await logInUser(page, email, password)
+    await page.goto("/admin")
+    await page
+      .getByRole("row")
+      .filter({ hasText: targetEmail })
+      .getByRole("button")
+      .click()
+    await page.getByRole("menuitem", { name: "Edit User" }).click()
+    await page.getByPlaceholder("Full name").fill("Should Not Be Saved")
+
+    // A separate Admin session (the first Admin, via the API so the test does
+    // not depend on table pagination) demotes that Admin to Manager.
+    await setUserRole(admin.id, "manager")
+
+    // Submitting the stale form is rejected by the backend.
+    const patchResponse = page.waitForResponse(
+      (r) =>
+        r.request().method() === "PATCH" &&
+        r.url().endsWith(`/api/v1/users/${target.id}`),
+    )
+    await page.getByRole("button", { name: "Save" }).click()
+    expect((await patchResponse).status()).toBe(403)
+    await expect(
+      page.getByText("The user doesn't have enough privileges"),
+    ).toBeVisible()
+    expect(await getUser(target.id)).toEqual(targetBefore)
+
+    // Same session: not signed out, own profile still available.
+    await expect(page).toHaveURL("/admin")
+    await page.goto("/settings")
+    await expect(page).toHaveURL("/settings")
+    await expect(page.getByRole("tabpanel").getByText(email)).toBeVisible()
+
+    // The UI now reflects Manager permissions.
+    await page.goto("/admin")
+    await expect(page.getByRole("heading", { name: "Users" })).toBeVisible()
+    await expect(page.getByRole("button", { name: "Add User" })).toHaveCount(0)
   })
 
   test("Admin can access admin and metrics pages", async ({ page }) => {

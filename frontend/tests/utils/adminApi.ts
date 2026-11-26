@@ -30,6 +30,14 @@ export const createUserWithRole = async ({
   return response.data
 }
 
+export const getUser = async (userId: string) => {
+  const response = await UsersService.readUserById({
+    path: { user_id: userId },
+    headers: await adminHeaders(),
+  })
+  return response.data
+}
+
 export const setUserRole = async (userId: string, role: UserRole) => {
   await UsersService.updateUser({
     path: { user_id: userId },
