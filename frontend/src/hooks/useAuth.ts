@@ -1,10 +1,16 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useNavigate } from "@tanstack/react-router"
+import {
+  type QueryClient,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
+import { redirect, useNavigate } from "@tanstack/react-router"
 
 import {
   type Body_login_login_access_token as AccessToken,
   LoginService,
-  type UserPublic,
+  type Permission,
+  type UserMe,
   type UserRegister,
   UsersService,
 } from "@/client"
@@ -15,14 +21,39 @@ const isLoggedIn = () => {
   return localStorage.getItem("access_token") !== null
 }
 
+const currentUserQueryOptions = {
+  queryKey: ["currentUser"],
+  queryFn: async () => (await UsersService.readUserMe()).data,
+}
+
+// Permissions come from the backend (/users/me); the UI only mirrors them.
+const hasPermission = (
+  user: UserMe | null | undefined,
+  permission: Permission,
+): boolean => user?.permissions.includes(permission) ?? false
+
+// Route guard: always refetches /users/me so a role change made during the
+// current session is honored on the next navigation.
+const requirePermission = async (
+  queryClient: QueryClient,
+  permission: Permission,
+) => {
+  const user = await queryClient.fetchQuery({
+    ...currentUserQueryOptions,
+    staleTime: 0,
+  })
+  if (!hasPermission(user, permission)) {
+    throw redirect({ to: "/" })
+  }
+}
+
 const useAuth = () => {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { showErrorToast } = useCustomToast()
 
-  const { data: user } = useQuery<UserPublic | null, Error>({
-    queryKey: ["currentUser"],
-    queryFn: async () => (await UsersService.readUserMe()).data,
+  const { data: user } = useQuery<UserMe | null, Error>({
+    ...currentUserQueryOptions,
     enabled: isLoggedIn(),
   })
 
@@ -55,6 +86,8 @@ const useAuth = () => {
 
   const logout = () => {
     localStorage.removeItem("access_token")
+    // Drop cached data (including permissions) so the next user starts clean.
+    queryClient.clear()
     navigate({ to: "/login" })
   }
 
@@ -66,5 +99,5 @@ const useAuth = () => {
   }
 }
 
-export { isLoggedIn }
+export { hasPermission, isLoggedIn, requirePermission }
 export default useAuth

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test"
 import { firstSuperuser, firstSuperuserPassword } from "./config.ts"
+import { createUserWithRole, setUserRole } from "./utils/adminApi"
 import { createUser } from "./utils/privateApi"
 import { randomEmail, randomPassword } from "./utils/random"
 import { logInUser } from "./utils/user"
@@ -42,28 +43,51 @@ test.describe("Admin user management", () => {
     await expect(userRow).toBeVisible()
   })
 
-  test("Create a superuser", async ({ page }) => {
+  for (const role of ["Manager", "Member"]) {
+    test(`Create a ${role.toLowerCase()}`, async ({ page }) => {
+      await page.goto("/admin")
+
+      const email = randomEmail()
+      const password = randomPassword()
+
+      await page.getByRole("button", { name: "Add User" }).click()
+
+      await page.getByPlaceholder("Email").fill(email)
+      await page.getByPlaceholder("Password").first().fill(password)
+      await page.getByPlaceholder("Password").last().fill(password)
+      await page.getByLabel("Role").click()
+      await page.getByRole("option", { name: role }).click()
+      await page.getByLabel("Is active?").check()
+
+      await page.getByRole("button", { name: "Save" }).click()
+
+      await expect(page.getByText("User created successfully")).toBeVisible()
+
+      await expect(page.getByRole("dialog")).not.toBeVisible()
+
+      const userRow = page.getByRole("row").filter({ hasText: email })
+      await expect(userRow.getByText(role, { exact: true })).toBeVisible()
+    })
+  }
+
+  test("Change a user's role", async ({ page }) => {
+    const email = randomEmail()
+    await createUserWithRole({
+      email,
+      password: randomPassword(),
+      role: "member",
+    })
     await page.goto("/admin")
 
-    const email = randomEmail()
-    const password = randomPassword()
-
-    await page.getByRole("button", { name: "Add User" }).click()
-
-    await page.getByPlaceholder("Email").fill(email)
-    await page.getByPlaceholder("Password").first().fill(password)
-    await page.getByPlaceholder("Password").last().fill(password)
-    await page.getByLabel("Is superuser?").check()
-    await page.getByLabel("Is active?").check()
-
+    const userRow = page.getByRole("row").filter({ hasText: email })
+    await userRow.getByRole("button").click()
+    await page.getByRole("menuitem", { name: "Edit User" }).click()
+    await page.getByLabel("Role").click()
+    await page.getByRole("option", { name: "Manager" }).click()
     await page.getByRole("button", { name: "Save" }).click()
 
-    await expect(page.getByText("User created successfully")).toBeVisible()
-
-    await expect(page.getByRole("dialog")).not.toBeVisible()
-
-    const userRow = page.getByRole("row").filter({ hasText: email })
-    await expect(userRow.getByText("Superuser")).toBeVisible()
+    await expect(page.getByText("User updated successfully")).toBeVisible()
+    await expect(userRow.getByText("Manager", { exact: true })).toBeVisible()
   })
 
   test("Edit a user successfully", async ({ page }) => {
@@ -182,24 +206,77 @@ test.describe("Admin user management", () => {
 test.describe("Admin page access control", () => {
   test.use({ storageState: { cookies: [], origins: [] } })
 
-  test("Non-superuser cannot access admin page", async ({ page }) => {
+  test("Member is redirected away from admin and metrics pages", async ({
+    page,
+  }) => {
     const email = randomEmail()
     const password = randomPassword()
 
     await createUser({ email, password })
     await logInUser(page, email, password)
 
-    await page.goto("/admin")
+    await expect(page.getByRole("link", { name: "Admin" })).not.toBeVisible()
+    await expect(page.getByRole("link", { name: "Metrics" })).not.toBeVisible()
 
-    await expect(page.getByRole("heading", { name: "Users" })).not.toBeVisible()
-    await expect(page).not.toHaveURL(/\/admin/)
+    for (const path of ["/admin", "/metrics"]) {
+      await page.goto(path)
+      await expect(page).toHaveURL("/")
+      // Still signed in after being denied.
+      await expect(
+        page.getByText("Welcome back, nice to see you again!"),
+      ).toBeVisible()
+    }
   })
 
-  test("Superuser can access admin page", async ({ page }) => {
+  test("Manager can view users and metrics but not manage users", async ({
+    page,
+  }) => {
+    const email = randomEmail()
+    const password = randomPassword()
+    await createUserWithRole({ email, password, role: "manager" })
+    await logInUser(page, email, password)
+
+    await page.getByRole("link", { name: "Admin" }).click()
+    await expect(page.getByRole("heading", { name: "Users" })).toBeVisible()
+    await expect(page.getByRole("row").filter({ hasText: email })).toBeVisible()
+    await expect(page.getByRole("button", { name: "Add User" })).toHaveCount(0)
+    // For an Admin every other user's row has an edit/delete menu button.
+    await expect(page.getByRole("table").getByRole("button")).toHaveCount(0)
+
+    await page.getByRole("link", { name: "Metrics" }).click()
+    await expect(page.getByRole("heading", { name: "Metrics" })).toBeVisible()
+  })
+
+  test("Role change applies to direct navigation in the same session", async ({
+    page,
+  }) => {
+    const email = randomEmail()
+    const password = randomPassword()
+    const user = await createUserWithRole({ email, password, role: "member" })
+    await logInUser(page, email, password)
+
+    await page.goto("/metrics")
+    await expect(page).toHaveURL("/")
+
+    await setUserRole(user.id, "manager")
+    await page.goto("/metrics")
+    await expect(page.getByRole("heading", { name: "Metrics" })).toBeVisible()
+
+    await setUserRole(user.id, "member")
+    await page.goto("/metrics")
+    await expect(page).toHaveURL("/")
+    await expect(
+      page.getByText("Welcome back, nice to see you again!"),
+    ).toBeVisible()
+  })
+
+  test("Admin can access admin and metrics pages", async ({ page }) => {
     await logInUser(page, firstSuperuser, firstSuperuserPassword)
 
     await page.goto("/admin")
-
     await expect(page.getByRole("heading", { name: "Users" })).toBeVisible()
+
+    await page.goto("/metrics")
+    await expect(page.getByRole("heading", { name: "Metrics" })).toBeVisible()
   })
 })
